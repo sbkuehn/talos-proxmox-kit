@@ -15,6 +15,20 @@ helm upgrade --install eg oci://docker.io/envoyproxy/gateway-helm \
 kubectl wait --timeout=5m -n envoy-gateway-system \
   deployment/envoy-gateway --for=condition=Available
 
+# Browsers quietly upgrade hostnames to https://, so the gateway listens on 443 too.
+# A self-signed wildcard cert covers every app until cert-manager replaces it.
+# The key stays outside the repo, next to your Talos configs.
+mkdir -p "${OUT_DIR}"
+if [[ ! -f "${OUT_DIR}/lab-tls.crt" ]]; then
+  openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+    -keyout "${OUT_DIR}/lab-tls.key" -out "${OUT_DIR}/lab-tls.crt" \
+    -subj "/CN=*.${DOMAIN}" \
+    -addext "subjectAltName=DNS:*.${DOMAIN},DNS:${DOMAIN}"
+fi
+kubectl -n envoy-gateway-system create secret tls lab-tls \
+  --cert="${OUT_DIR}/lab-tls.crt" --key="${OUT_DIR}/lab-tls.key" \
+  --dry-run=client -o yaml | kubectl apply -f -
+
 # The EnvoyProxy resource pins the gateway's MetalLB IP so DNS never has to change.
 kubectl apply -f - <<EOF
 apiVersion: gateway.envoyproxy.io/v1alpha1
@@ -56,6 +70,17 @@ spec:
       allowedRoutes:
         namespaces:
           from: All
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "*.${DOMAIN}"
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: lab-tls
+      allowedRoutes:
+        namespaces:
+          from: All
 ---
 apiVersion: gateway.networking.k8s.io/v1
 kind: HTTPRoute
@@ -78,10 +103,17 @@ kubectl -n envoy-gateway-system wait --for=condition=Programmed \
   gateway/lab-gateway --timeout=3m
 kubectl -n envoy-gateway-system get gateway lab-gateway
 
-printf "==> testing hubble.%s through %s: " "$DOMAIN" "$GATEWAY_IP"
-curl -s -o /dev/null -w "%{http_code}\n" -H "Host: hubble.${DOMAIN}" "http://${GATEWAY_IP}/" || true
+printf "==> http  hubble.%s via %s: " "$DOMAIN" "$GATEWAY_IP"
+curl -s -m 5 -o /dev/null -w "%{http_code}\n" -H "Host: hubble.${DOMAIN}" "http://${GATEWAY_IP}/" || true
+printf "==> https hubble.%s via %s: " "$DOMAIN" "$GATEWAY_IP"
+curl -sk -m 5 -o /dev/null -w "%{http_code}\n" --resolve "hubble.${DOMAIN}:443:${GATEWAY_IP}" "https://hubble.${DOMAIN}/" || true
 
 echo
-echo "Expect 200. Then add a DNS A record: hubble.${DOMAIN} -> ${GATEWAY_IP}"
+echo "Expect 200 twice. Then add a DNS A record: hubble.${DOMAIN} -> ${GATEWAY_IP}"
+echo "Open https://hubble.${DOMAIN} and accept the self-signed certificate warning once."
 echo "Each new app needs an HTTPRoute like the one above plus one DNS record"
 echo "(or a single wildcard record such as *.apps.${DOMAIN})."
+echo
+echo "Devices running Tailscale that advertise or accept a route for your home"
+echo "network may send LAN traffic through the tailnet. Turn off 'Use Tailscale"
+echo "subnets' on devices that live at home if the gateway times out for them."
